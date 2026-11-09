@@ -1,0 +1,288 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gear Parameter Calculator</title>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+<style>
+body {
+    font-family: Arial, sans-serif;
+    background: #eef2f7;
+    padding: 25px;
+}
+.container {
+    max-width: 800px;
+    margin: auto;
+    background: white;
+    padding: 25px;
+    border-radius: 12px;
+}
+h1 { text-align: center; color: #123b65; }
+input, button {
+    width: 100%;
+    padding: 12px;
+    margin: 12px 0;
+    box-sizing: border-box;
+}
+button {
+    background: #1769aa;
+    color: white;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+}
+img {
+    max-width: 100%;
+    margin-top: 15px;
+}
+.result {
+    background: #f0f6fc;
+    padding: 15px;
+    margin-top: 20px;
+    border-radius: 8px;
+}
+</style>
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>⚙️ Gear Parameter Calculator</h1>
+<p>Calculation of Gear Parameters Using Machine Vision</p>
+
+<h3>1. Upload Gear Image</h3>
+<input type="file" id="upload" accept="image/*">
+<img id="preview">
+
+<button onclick="detectTeeth()">Estimate Number of Teeth</button>
+
+<div class="result">
+    <h3>Estimated Number of Teeth</h3>
+    <h2 id="toothCount">Not detected</h2>
+</div>
+
+<h3>2. Enter Outside Diameter</h3>
+<input type="number" id="diameter"
+       placeholder="Outside diameter in mm" min="0.01" step="any">
+
+<button onclick="calculateGear()">Calculate Gear Parameters</button>
+
+<div class="result" id="results" style="display:none">
+    <h3>Calculated Parameters</h3>
+    <p id="output"></p>
+</div>
+
+<p id="message"></p>
+
+</div>
+
+<script>
+
+let imageElement = document.getElementById("preview");
+let estimatedTeeth = 0;
+
+document.getElementById("upload").addEventListener("change", function(event) {
+    const file = event.target.files[0];
+    if (file) {
+        imageElement.src = URL.createObjectURL(file);
+        document.getElementById("toothCount").textContent = "Not detected";
+        estimatedTeeth = 0;
+    }
+});
+
+function detectTeeth() {
+
+    if (typeof cv === "undefined" || !cv.Mat) {
+        document.getElementById("message").textContent =
+            "OpenCV is still loading. Please wait and try again.";
+        return;
+    }
+
+    if (!imageElement.src || !imageElement.complete ||
+        imageElement.naturalWidth === 0) {
+        document.getElementById("message").textContent =
+            "Please upload a gear image first.";
+        return;
+    }
+
+    let src, gray, blurred, edges, contours, hierarchy;
+
+    try {
+        src = cv.imread(imageElement);
+        gray = new cv.Mat();
+        blurred = new cv.Mat();
+        edges = new cv.Mat();
+        contours = new cv.MatVector();
+        hierarchy = new cv.Mat();
+
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+        cv.Canny(blurred, edges, 50, 150);
+
+        cv.findContours(
+            edges, contours, hierarchy,
+            cv.RETR_EXTERNAL, cv.CHAIN_APPROX_NONE
+        );
+
+        let largestIndex = -1;
+        let largestArea = 0;
+
+        for (let i = 0; i < contours.size(); i++) {
+            let contour = contours.get(i);
+            let area = cv.contourArea(contour);
+
+            if (area > largestArea) {
+                largestArea = area;
+                largestIndex = i;
+            }
+            contour.delete();
+        }
+
+        if (largestIndex < 0 || largestArea < 100) {
+            throw new Error("Gear contour not found. Try a clearer image.");
+        }
+
+        let contour = contours.get(largestIndex);
+        let moments = cv.moments(contour);
+
+        if (Math.abs(moments.m00) < 1e-6) {
+            contour.delete();
+            throw new Error("Could not locate the gear centre.");
+        }
+
+        let cx = moments.m10 / moments.m00;
+        let cy = moments.m01 / moments.m00;
+
+        // Radial distance profile around the gear centre
+        const bins = 720;
+        let radial = new Array(bins).fill(0);
+
+        for (let i = 0; i < contour.data32S.length; i += 2) {
+            let x = contour.data32S[i];
+            let y = contour.data32S[i + 1];
+
+            let angle = Math.atan2(y - cy, x - cx);
+            let index = Math.floor(
+                ((angle + Math.PI) / (2 * Math.PI)) * bins
+            );
+
+            index = Math.max(0, Math.min(bins - 1, index));
+
+            let distance = Math.hypot(x - cx, y - cy);
+            radial[index] = Math.max(radial[index], distance);
+        }
+
+        // Fill missing angular samples
+        for (let i = 0; i < bins; i++) {
+            if (radial[i] === 0) {
+                let left = radial[(i - 1 + bins) % bins];
+                let right = radial[(i + 1) % bins];
+                radial[i] = (left + right) / 2;
+            }
+        }
+
+        // Smooth the radial profile
+        let smooth = radial.map((value, i) => {
+            let sum = 0;
+            for (let j = -3; j <= 3; j++) {
+                sum += radial[(i + j + bins) % bins];
+            }
+            return sum / 7;
+        });
+
+        // Estimate local radial peaks
+        let peaks = [];
+
+        for (let i = 0; i < bins; i++) {
+            let previous = smooth[(i - 1 + bins) % bins];
+            let next = smooth[(i + 1) % bins];
+
+            if (smooth[i] > previous && smooth[i] >= next) {
+                peaks.push({index: i, value: smooth[i]});
+            }
+        }
+
+        // Keep peaks separated to avoid counting one tooth multiple times
+        peaks.sort((a, b) => b.value - a.value);
+
+        let selected = [];
+
+        for (let peak of peaks) {
+            let separated = selected.every(p => {
+                let difference = Math.abs(p.index - peak.index);
+                difference = Math.min(difference, bins - difference);
+                return difference >= 12;
+            });
+
+            if (separated) selected.push(peak);
+        }
+
+        estimatedTeeth = selected.length;
+
+        if (estimatedTeeth < 3) {
+            estimatedTeeth = 0;
+            throw new Error("Unable to estimate teeth. Try another image.");
+        }
+
+        document.getElementById("toothCount").textContent =
+            estimatedTeeth + " teeth (estimated)";
+
+        document.getElementById("message").textContent =
+            "Please verify the estimated tooth count before using the results.";
+
+        contour.delete();
+
+    } catch (error) {
+        document.getElementById("message").textContent = error.message;
+    } finally {
+        if (src) src.delete();
+        if (gray) gray.delete();
+        if (blurred) blurred.delete();
+        if (edges) edges.delete();
+        if (contours) contours.delete();
+        if (hierarchy) hierarchy.delete();
+    }
+}
+
+function calculateGear() {
+
+    if (!estimatedTeeth) {
+        alert("Please upload an image and estimate the teeth first.");
+        return;
+    }
+
+    let Z = estimatedTeeth;
+    let Da = Number(document.getElementById("diameter").value);
+
+    if (!Number.isFinite(Da) || Da <= 0) {
+        alert("Enter a valid outside diameter.");
+        return;
+    }
+
+    let m = Da / (Z + 2);
+    let D = m * Z;
+    let Df = m * (Z - 2.5);
+    let addendum = m;
+    let dedendum = 1.25 * m;
+
+    document.getElementById("output").innerHTML = `
+        <b>Number of Teeth:</b> ${Z}<br><br>
+        <b>Outside Diameter:</b> ${Da.toFixed(3)} mm<br><br>
+        <b>Module:</b> ${m.toFixed(3)} mm<br><br>
+        <b>Pitch Diameter:</b> ${D.toFixed(3)} mm<br><br>
+        <b>Root Diameter:</b> ${Df.toFixed(3)} mm<br><br>
+        <b>Addendum:</b> ${addendum.toFixed(3)} mm<br><br>
+        <b>Dedendum:</b> ${dedendum.toFixed(3)} mm
+    `;
+
+    document.getElementById("results").style.display = "block";
+}
+
+</script>
+</body>
+</html>
